@@ -1,0 +1,151 @@
+name: Detect Changed Directories
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest  #runs-on: ubuntu-20.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull Docker image
+        run: docker pull alpine:latest
+
+      - name: Use secrets in steps
+        run: |
+          echo "API key is set: ${{ secrets.API_KEY != '' }}"
+          echo "DB: $DATABASE_URL"
+
+      - name: Detect changed directories
+        run: |
+          CHANGED_DIRS=""
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            dir=$(dirname "$file")
+            if [ "$dir" != "." ]; then
+              first_char=$(echo "$dir" | cut -c1)
+              if [ "$first_char" != "." ]; then
+                if [[ ! " $CHANGED_DIRS " =~ " $dir " ]]; then
+                  CHANGED_DIRS="$CHANGED_DIRS $dir"
+                fi
+              fi
+            fi
+          done
+          echo "Changed directories:$CHANGED_DIRS"
+          echo "$CHANGED_DIRS" > $RUNNER_TEMP/changed_dirs.txt
+
+      - name: Process changed directories
+        id: process
+        run: |
+          .github/workflows/process_dirs.sh
+          # echo "result_file=result.txt" >> $GITHUB_OUTPUT
+          # echo "artifact_name=release-$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+
+      - name: Upload release package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.process.outputs.artifact_name }}
+          path: ${{ steps.process.outputs.result_file }}
+          retention-days: 30
+
+      - name: Create tag with timestamp
+        if: false
+        # if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          TAG_NAME="release-$(date +%Y%m%d-%H%M%S)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
+
+      - name: Create Release
+        if: false
+        # if: success() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.process.outputs.result_file }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Upload to specified Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! command -v gh &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y gh
+          fi
+          RELEASE_FILES="${{ steps.process.outputs.result_file }}"
+          for file in $RELEASE_FILES; do
+            gh release upload vbyci "$file" --clobber
+          done
+
+      - name: Upload to WebDAV
+        if: success()
+        run: |
+          RELEASE_FILES="${{ steps.process.outputs.result_file }}"
+          for file in $RELEASE_FILES; do
+            curl -u "${{ secrets.WEBDAV_USER }}:${{ secrets.WEBDAV_PASSWORD }}" \
+              -T "$file" \
+              "${{ secrets.WEBDAV_URL }}"
+          done
+
+      - name: Clean old releases and tags
+        if: false
+        # if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Install gh if needed
+          if ! command -v gh &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y gh
+          fi
+          
+          # Configure git with token
+          git remote set-url origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}
+          
+          # Get current timestamp and calculate 30 days ago
+          CUTOFF_DATE=$(date -d "30 days ago" +%Y-%m-%d)
+          
+          # Delete old releases (keep latest 5, exclude v0*)
+          RELEASES=$(gh release list --limit 100 --json tagName,createdAt -q '.[] | "\(.tagName)|\(.createdAt)"')
+          COUNT=0
+          for release in $RELEASES; do
+            tag=$(echo "$release" | cut -d'|' -f1)
+            date=$(echo "$release" | cut -d'|' -f2 | cut -d'T' -f1)
+            if [[ "$tag" == v0* ]]; then
+              continue
+            fi
+            if [[ "$date" < "$CUTOFF_DATE" ]]; then
+              COUNT=$((COUNT+1))
+              if [ $COUNT -gt 5 ]; then
+                echo "Deleting release: $tag"
+                gh release delete "$tag" --yes
+              fi
+            fi
+          done
+          
+          # Delete old tags (exclude v0*)
+          TAGS=$(git ls-remote --tags origin | grep -E 'refs/tags/release-' | cut -d$'\t' -f2 | sed 's|refs/tags/||')
+          for tag in $TAGS; do
+            if [[ "$tag" != v0* ]]; then
+              echo "Deleting tag: $tag"
+              git push origin --delete "$tag"
+            fi
+          done
